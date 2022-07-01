@@ -6,30 +6,19 @@ Disjunctive relational abstract domain to be used for **algorithmic bias analysi
 
 :Authors: Caterina Urban
 """
-from collections import defaultdict
 from copy import deepcopy
 from enum import Enum
-from itertools import chain
 from math import inf
-from typing import Set, List, Dict
+from typing import Set, List
 
-from apronpy.coeff import PyMPQScalarCoeff
-from apronpy.environment import PyEnvironment
-from apronpy.lincons1 import PyLincons1Array
 from apronpy.manager import PyManager
-from apronpy.polka import PyPolka
-from apronpy.scalar import PyMPQScalar
-from apronpy.tcons1 import PyTcons1Array, PyTcons1
-from apronpy.texpr0 import TexprRtype, TexprRdir, TexprDiscr, TexprOp
 from apronpy.texpr1 import PyTexpr1
 from apronpy.var import PyVar
 
 from agbs.abstract_domains.state import State
 from agbs.core.expressions import VariableIdentifier, Expression, BinaryComparisonOperation, \
-    BinaryBooleanOperation, Lyra2APRON, \
-    NegationFreeExpression, Literal, UnaryArithmeticOperation
+    BinaryBooleanOperation, Lyra2APRON, NegationFreeExpression, Literal, UnaryArithmeticOperation
 from agbs.core.utils import copy_docstring
-from agbs.abstract_domains.bounds_domain import BoundsDomain
 
 
 class IntervalLattice:
@@ -163,131 +152,22 @@ class IntervalLattice:
         return self
 
 
-rtype = TexprRtype.AP_RTYPE_REAL
-rdir = TexprRdir.AP_RDIR_RND
-
-
-def texpr_to_dict(texpr):
-
-    def do(texpr0, env):
-        if texpr0.discr == TexprDiscr.AP_TEXPR_CST:
-            result = dict()
-            t0 = '{}'.format(texpr0.val.cst)
-            t1 = eval(t0)
-            t2 = str(t1)
-            t3 = float(t2)
-            result['_'] = t3
-            return result
-        elif texpr0.discr == TexprDiscr.AP_TEXPR_DIM:
-            result = dict()
-            result['{}'.format(env.var_of_dim[texpr0.val.dim.value].decode('utf-8'))] = 1.0
-            return result
-        else:
-            assert texpr0.discr == TexprDiscr.AP_TEXPR_NODE
-            left = do(texpr0.val.node.contents.exprA.contents, env)
-            op = texpr0.val.node.contents.op
-            if texpr0.val.node.contents.exprB:
-                right = do(texpr0.val.node.contents.exprB.contents, env)
-            if op == TexprOp.AP_TEXPR_ADD:
-                result = deepcopy(left)
-                for var, val in right.items():
-                    if var in result:
-                        result[var] += val
-                    else:
-                        result[var] = val
-                return result
-            elif op == TexprOp.AP_TEXPR_SUB:
-                result = deepcopy(left)
-                for var, val in right.items():
-                    if var in result:
-                        result[var] -= val
-                    else:
-                        result[var] = -val
-                return result
-            elif op == TexprOp.AP_TEXPR_MUL:
-                # print('multiplying')
-                # print('left: ', left)
-                # print('right: ', right)
-                result = dict()
-                if '_' in left and len(left) == 1:
-                    for var, val in right.items():
-                        result[var] = left['_'] * right[var]
-                elif '_' in right and len(right) == 1:
-                    for var, val in left.items():
-                        result[var] = right['_'] * left[var]
-                else:
-                    assert False
-                # print('result: ', result)
-            elif op == TexprOp.AP_TEXPR_NEG:
-                result = deepcopy(left)
-                for var, val in result.items():
-                    result[var] = -val
-        return result
-
-    texpr1 = texpr.texpr1.contents
-    return do(texpr1.texpr0.contents, texpr1.env.contents)
-
-
-def evaluate(dictionary, bounds):
-    result = IntervalLattice(0, 0)
-    for var, val in dictionary.items():
-        coeff = IntervalLattice(val, val)
-        if var != '_':
-            result = result._add(coeff._mult(bounds[var]))
-        else:
-            result = result._add(coeff)
-    return result
-
-# def substitute_in_dict(todict, var, rhs):
-#     result = todict
-#     key = str(var)
-#     coeff = result[key]
-#     del result[key]
-#     for var, val in rhs.items():
-#         if var in result:
-#             result[var] += coeff * val
-#         else:
-#             result[var] = coeff * val
-#     return result
-
-
-# def dict_to_texpr(todict, env):
-#     texpr = PyTexpr1.cst(env, PyMPQScalarCoeff(PyMPQScalar(todict['_'])))
-#     for var, val in reversed(list(todict.items())):
-#         if var != '_':
-#             coeff = PyTexpr1.cst(env, PyMPQScalarCoeff(PyMPQScalar(val)))
-#             dim = PyTexpr1.var(env, PyVar(var))
-#             term = PyTexpr1.binop(TexprOp.AP_TEXPR_MUL, coeff, dim, TexprRtype.AP_RTYPE_REAL, TexprRdir.AP_RDIR_RND)
-#             texpr = PyTexpr1.binop(TexprOp.AP_TEXPR_ADD, term, texpr, TexprRtype.AP_RTYPE_REAL, TexprRdir.AP_RDIR_RND)
-#     return texpr
-
-
-class DeepPolyStateB(State, BoundsDomain):
+class Box2State(State):
     """DeepPoly [Singh et al. POPL2019] state.
 
     .. document private methods
-    .. automethod:: DeepPolyStateB._assign
-    .. automethod:: DeepPolyStateB._assume
-    .. automethod:: DeepPolyStateB._output
-    .. automethod:: DeepPolyStateB._substitute
+    .. automethod:: Box2State._assign
+    .. automethod:: Box2State._assume
+    .. automethod:: Box2State._output
+    .. automethod:: Box2State._substitute
 
     """
     def __init__(self, inputs: Set[VariableIdentifier], precursory: State = None):
         super().__init__(precursory=precursory)
         self.inputs = {input.name for input in inputs}
-        # self.variables: Dict[str, VariableIdentifier] = dict()
-        # for variable in variables:
-        #     self.variables[variable.name] = variable
         self.bounds = dict()
         for input in self.inputs:
             self.bounds[input] = IntervalLattice(-inf, inf)
-        self.poly = dict()
-        for input in self.inputs:
-            lower: Dict[str, float] = dict()
-            lower['_'] = -inf
-            upper: Dict[str, float] = dict()
-            upper['_'] = inf
-            self.poly[input] = (lower, upper)
         self.expressions = dict()
         self.polarities = dict()
         self.flag = None
@@ -317,46 +197,34 @@ class DeepPolyStateB(State, BoundsDomain):
         return all(element.is_top() for element in self.bounds.values())
 
     @copy_docstring(State._less_equal)
-    def _less_equal(self, other: 'DeepPolyStateB') -> bool:
+    def _less_equal(self, other: 'Box2State') -> bool:
         raise NotImplementedError(f"Call to _is_less_equal is unexpected!")
 
     @copy_docstring(State._join)
-    def _join(self, other: 'DeepPolyStateB') -> 'DeepPolyStateB':
+    def _join(self, other: 'Box2State') -> 'Box2State':
         for var in self.bounds:
             self.bounds[var].join(other.bounds[var])
-            bounds = self.bounds[var]
-            lower: Dict[str, float] = dict()
-            lower['_'] = bounds.lower
-            upper: Dict[str, float] = dict()
-            upper['_'] = bounds.upper
-            self.poly[var] = (lower, upper)
         return self
 
     @copy_docstring(State._meet)
-    def _meet(self, other: 'DeepPolyStateB') -> 'DeepPolyStateB':
+    def _meet(self, other: 'Box2State') -> 'Box2State':
         for var in self.bounds:
             self.bounds[var].meet(other.bounds[var])
-            bounds = self.bounds[var]
-            lower: Dict[str, float] = dict()
-            lower['_'] = bounds.lower
-            upper: Dict[str, float] = dict()
-            upper['_'] = bounds.upper
-            self.poly[var] = (lower, upper)
         return self
 
     @copy_docstring(State._widening)
-    def _widening(self, other: 'DeepPolyStateB') -> 'DeepPolyStateB':
+    def _widening(self, other: 'Box2State') -> 'Box2State':
         raise NotImplementedError(f"Call to _widening is unexpected!")
 
     @copy_docstring(State._assign)
-    def _assign(self, left: Expression, right: Expression) -> 'DeepPolyStateB':
+    def _assign(self, left: Expression, right: Expression) -> 'Box2State':
         raise NotImplementedError(f"Call to _assign is unexpected!")
 
     @copy_docstring(State._assume)
-    def _assume(self, condition: Expression, bwd: bool = False) -> 'DeepPolyStateB':
+    def _assume(self, condition: Expression, bwd: bool = False) -> 'Box2State':
         raise NotImplementedError(f"Call to _assume is unexpected!")
 
-    def assume(self, condition, manager: PyManager = None, bwd: bool = False) -> 'DeepPolyStateB':
+    def assume(self, condition, manager: PyManager = None, bwd: bool = False) -> 'Box2State':
         if self.is_bottom():
             return self
         if isinstance(condition, tuple):
@@ -364,12 +232,6 @@ class DeepPolyStateB(State, BoundsDomain):
         if isinstance(condition, list):
             for feature, (lower, upper) in condition:
                 self.bounds[feature.name].meet(IntervalLattice(lower, upper))
-                bounds = self.bounds[feature.name]
-                _inf: Dict[str, float] = dict()
-                _inf['_'] = bounds.lower
-                sup: Dict[str, float] = dict()
-                sup['_'] = bounds.upper
-                self.poly[feature.name] = (_inf, sup)
             return self
         elif isinstance(condition, BinaryBooleanOperation):
             if condition.operator == BinaryBooleanOperation.Operator.Or:
@@ -398,12 +260,6 @@ class DeepPolyStateB(State, BoundsDomain):
                     upper = -eval(condition.right.right.expression.val)
                 assert condition.left.right.name == condition.right.left.name
                 self.bounds[condition.left.right.name].meet(IntervalLattice(lower, upper))
-                bounds = self.bounds[condition.left.right.name]
-                _inf: Dict[str, float] = dict()
-                _inf['_'] = bounds.lower
-                sup: Dict[str, float] = dict()
-                sup['_'] = bounds.upper
-                self.poly[condition.right.left.name] = (_inf, sup)
                 return self
         elif isinstance(condition, BinaryComparisonOperation):
             if condition.operator == BinaryComparisonOperation.Operator.Gt:
@@ -412,12 +268,6 @@ class DeepPolyStateB(State, BoundsDomain):
                 lower = eval(condition.right.val)
                 upper = inf
                 self.bounds[condition.left.name].meet(IntervalLattice(lower, upper))
-                bounds = self.bounds[condition.left.name]
-                _inf: Dict[str, float] = dict()
-                _inf['_'] = bounds.lower
-                sup: Dict[str, float] = dict()
-                sup['_'] = bounds.upper
-                self.poly[condition.left.name] = (_inf, sup)
                 return self
             elif condition.operator == BinaryComparisonOperation.Operator.LtE:
                 assert isinstance(condition.left, VariableIdentifier)
@@ -425,12 +275,6 @@ class DeepPolyStateB(State, BoundsDomain):
                 lower = -inf
                 upper = eval(condition.right.val)
                 self.bounds[condition.left.name].meet(IntervalLattice(lower, upper))
-                bounds = self.bounds[condition.left.name]
-                _inf: Dict[str, float] = dict()
-                _inf['_'] = bounds.lower
-                sup: Dict[str, float] = dict()
-                sup['_'] = bounds.upper
-                self.poly[condition.left.name] = (_inf, sup)
                 return self
         # elif isinstance(condition, PyTcons1):
         #     abstract1 = self.domain(manager, self.environment, array=PyTcons1Array([condition]))
@@ -443,65 +287,30 @@ class DeepPolyStateB(State, BoundsDomain):
         raise NotImplementedError(f"Assumption of {condition.__class__.__name__} is unsupported!")
 
     @copy_docstring(State._substitute)
-    def _substitute(self, left: Expression, right: Expression) -> 'DeepPolyStateB':
+    def _substitute(self, left: Expression, right: Expression) -> 'Box2State':
         raise NotImplementedError(f"Call to _substitute is unexpected!")
 
-    def forget(self, variables: List[VariableIdentifier]) -> 'DeepPolyStateB':
+    def forget(self, variables: List[VariableIdentifier]) -> 'Box2State':
         raise NotImplementedError(f"Call to _forget is unexpected!")
 
-    def affine(self, left: List[PyVar], right: List[PyTexpr1]) -> 'DeepPolyStateB':
+    def affine(self, left: List[PyVar], right: List[PyTexpr1]) -> 'Box2State':
         if self.is_bottom():
             return self
         for lhs, expr in zip(left, right):
             name = str(lhs)
             rhs = texpr_to_dict(expr)
-            _inf, inf = deepcopy(rhs), deepcopy(rhs)
-            _sup, sup = deepcopy(rhs), deepcopy(rhs)
-            self.poly[name] = (_inf, _sup)
-            while any(variable in inf and variable not in self.inputs for variable in self.poly):
-                for variable in self.poly:
-                    if variable in inf and variable not in self.inputs:  # should be replaced
-                        coeff = inf[variable]
-                        if coeff > 0:
-                            replacement = self.poly[variable][0]
-                        elif coeff < 0:
-                            replacement = self.poly[variable][1]
-                        else:  # coeff == 0
-                            replacement = dict()
-                            replacement['_'] = 0.0
-                        del inf[variable]
-                        for var, val in replacement.items():
-                            if var in inf:
-                                inf[var] += coeff * val
-                            else:
-                                inf[var] = coeff * val
-            while any(variable in sup and variable not in self.inputs for variable in self.poly):
-                for variable in self.poly:
-                    if variable in sup and variable not in self.inputs:  # should be replaced
-                        coeff = sup[variable]
-                        if coeff > 0:
-                            replacement = self.poly[variable][1]
-                        elif coeff < 0:
-                            replacement = self.poly[variable][0]
-                        else:  # coeff == 0
-                            replacement = dict()
-                            replacement['_'] = 0.0
-                        del sup[variable]
-                        for var, val in replacement.items():
-                            if var in sup:
-                                sup[var] += coeff * val
-                            else:
-                                sup[var] = coeff * val
+            inf = deepcopy(rhs)
+            sup = deepcopy(rhs)
+
             lower = evaluate(inf, self.bounds)
             upper = evaluate(sup, self.bounds)
             self.bounds[name] = IntervalLattice(lower.lower, upper.upper)
             if lower.lower < 0 and 0 < upper.upper:
-                # print(lower.lower, '<=', name, '<=', upper.upper)
-                self.expressions[name] = (inf, sup)
+                self.expressions[name] = ...
                 self.polarities[name] = (lower.lower + upper.upper) / (upper.upper - lower.lower)
         return self
 
-    def relu(self, stmt: PyVar, active: bool = False, inactive: bool = False) -> 'DeepPolyStateB':
+    def relu(self, stmt: PyVar, active: bool = False, inactive: bool = False) -> 'Box2State':
         if self.is_bottom():
             return self
         name = str(stmt)
@@ -511,38 +320,27 @@ class DeepPolyStateB(State, BoundsDomain):
             # l_j = u_j = 0
             self.bounds[name] = IntervalLattice(0, 0)
             # 0 <= x_j <= 0
-            zero: Dict[str, float] = dict()
-            zero['_'] = 0.0
-            self.poly[name] = (zero, zero)
             self.flag = -1
         elif 0 <= lower or active:
             if active and lower < 0:
                 self.bounds[name] = IntervalLattice(0, upper)
-                sup = self.poly[name][1]
-                zero: Dict[str, float] = dict()
-                zero['_'] = 0.0
-                self.poly[name] = (zero, sup)
             self.flag = 1
         else:   # case (c) in Fig. 4, equation (4)
-            # l_j = l_i && u_j = u_i
-            self.bounds[name] = IntervalLattice(lower, upper)
-            # x_i <= x_j <= u_i * (x_i - l_i) / (u_i - l_i)
-            inf = deepcopy(self.poly[name][0])
-            #
-            m = upper / (upper - lower)
-            if m > 0:
-                sup = self.poly[name][1]
-            elif m < 0:
-                sup = self.poly[name][0]
-            else:  # m == 0
-                sup = dict()
-                sup['_'] = 0.0
-            for var, val in sup.items():
-                sup[var] = m * val
-            q = - upper * lower / (upper - lower)
-            sup['_'] = sup['_'] + q
-            #
-            self.poly[name] = (inf, sup)
+            _active, _inactive = deepcopy(self.bounds), deepcopy(self.bounds)
+            _active[name] = _active[name].meet(IntervalLattice(0, upper))
+            _inactive[name] = _inactive[name].meet(IntervalLattice(0, 0))
+
+            if any(element.is_bottom() for element in _active.values()):
+                self.flag = -1
+            elif any(element.is_bottom() for element in _inactive.values()):
+                self.flag = 1
+            else:
+                self.flag = None
+
+            join = dict()
+            for variable, itv in _active.items():
+                join[variable] = itv.join(_inactive[variable])
+            self.bounds[name] = join[name].meet(IntervalLattice(0, upper))
             self.flag = None
         return self
 
@@ -575,6 +373,3 @@ class DeepPolyStateB(State, BoundsDomain):
 
     def resize_bounds(self, var_name, new_bounds):
         self.bounds[var_name] = IntervalLattice(new_bounds.lower, new_bounds.upper)
-
-    def get_expressions(self, var_name):
-        return self.expressions[var_name]
