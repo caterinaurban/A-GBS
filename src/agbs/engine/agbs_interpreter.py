@@ -6,7 +6,7 @@ from pulp import pulp, PULP_CBC_CMD
 from pip._vendor.colorama import Fore, Style
 
 from agbs.abstract_domains.state import State
-from agbs.abstract_domains.symbolic_domain import substitute_in_dict
+from agbs.abstract_domains.symbolic_domain import substitute_in_dict, evaluate_with_constraints
 from agbs.core.cfg import Node, Function, Activation
 from agbs.core.expressions import VariableIdentifier
 from agbs.core.statements import Call
@@ -62,7 +62,7 @@ class AGBSInterpreter:
     def pattern(self) -> List[Tuple[Set[str], Set[str]]]:
         return self._pattern
 
-    def fwd(self, initial, forced_active=None, forced_inactive=None):
+    def fwd(self, initial, forced_active=None, forced_inactive=None, constraints=None):
         """Single run of the forward analysis with the abstract domain"""
         worklist = Queue()
         worklist.put(self.cfg.in_node)
@@ -75,7 +75,7 @@ class AGBSInterpreter:
                 if activated or deactivated or uncertain:
                     activations.append((frozenset(activated), frozenset(deactivated), frozenset(uncertain)))
                     activated, deactivated, uncertain = set(), set(), set()
-                state = state.affine(current.stmts[0], current.stmts[1])
+                state = state.affine(current.stmts[0], current.stmts[1], constraints=constraints)
             elif isinstance(current, Activation):
                 if forced_active and current in forced_active:
                     state = state.relu(current.stmts, active=True)
@@ -122,7 +122,17 @@ class AGBSInterpreter:
                 if pack[2]:
                     uncertain.append({self.relus_node2name[n].name for n in pack[2]})
             if len(uncertain) == 0:
-                print('WTF')
+                # for o in self.outputs:
+                #     if o.name in state.expressions:
+                #         # back-substitution
+                #         current = state.expressions[o.name]
+                #         while any(variable in state.expressions for variable in state.expressions[o.name].keys()):
+                #             for sym, val in state.expressions.items():
+                #                 if sym in current:
+                #                     current = substitute_in_dict(current, sym, val)
+                #             state.expressions[o.name] = current
+                #         # evaluate_with_constraints(state.expressions[o.name])
+                return None, activations, None
             # pick output with smallest lower-bound
             lowers: Dict[str, float] = dict((o.name, state.bounds[o.name].lower) for o in self.outputs)
             picked: str = min(lowers, key=lowers.get)
@@ -134,7 +144,7 @@ class AGBSInterpreter:
             expression.pop('_')
             # remove forced active relus
             for r in forced_active:
-                expression.pop(self.relus_node2name[r].name)
+                expression.pop(self.relus_node2name[r].name, None)
             # rank relus by layer
             layer_score = lambda relu_name: len(uncertain) - list(relu_name in u for u in uncertain).index(True)
             # rank relus by coefficient
@@ -175,6 +185,44 @@ class AGBSInterpreter:
                         current = substitute_in_dict(current, sym, val)
                 expression = current
             return 0, activations, (chosen, expression)
+
+    def is_redundant(self, constraint, ranges, constraints):
+        """
+        Set the objective coefficients to those of one of the constraints, disable that constraint and solve the LP:
+    - if the constraint was a LE maximize. In case the optimal value is less or equal to the rhs, the constraint is redundant
+    - analogously if the constraint was GE minimize. disabled constraint is redundant if the optimal value or greater or equal to the rhs.
+        """
+        (expr, activity) = constraint
+        _ranges = dict(ranges)
+        current = dict(
+            objective=dict(
+                name=None,
+                coefficients=[
+                    {"name": name, "value": value} for name, value in expr.items() if name != '_'
+                ]),
+            constraints=[
+                dict(
+                    sense=status,
+                    pi=None,
+                    constant=expression['_'],
+                    name=None,
+                    coefficients=[
+                        {"name": name, "value": value} for name, value in expression.items() if name != '_'
+                    ],
+                ) for expression, status in constraints
+            ],
+            variables=[dict(lowBound=l, upBound=u, cat="Continuous", varValue=None, dj=None, name=v) for v, (l, u) in
+                       _ranges.items()],
+            parameters=dict(name="NoName", sense=-activity, status=0, sol_status=0),
+            sos1=list(),
+            sos2=list(),
+        )
+        var, problem = pulp.LpProblem.fromDict(current)
+        problem.solve(PULP_CBC_CMD(msg=False))
+        if activity < 0:
+            return pulp.value(problem.objective) + expr['_'] <= 0
+        elif activity > 0:
+            return pulp.value(problem.objective) + expr['_'] >= 0
 
     def to_pulp(self, ranges, constraints):
         _ranges = dict(ranges)
@@ -252,6 +300,15 @@ class AGBSInterpreter:
         alternatives = list()
         while status == 0:
             if nxt is None:
+                r_cstr = ''
+                for i, (e, a) in enumerate(constraints):
+                    r_expr = ' + '.join('({})*{}'.format(v, n) for n, v in e.items() if n != '_')
+                    r_expr = r_expr + ' + {}'.format(e['_'])
+                    if a > 0:
+                        r_cstr = r_cstr + '[{}+]: '.format(i) + r_expr + ' >= 0\n'
+                    else:
+                        r_cstr = r_cstr + '[{}-]: '.format(i) + r_expr + ' <= 0\n'
+                print('Constraints: ', r_cstr)
                 print('\n⊥︎')
                 return alternatives
 
@@ -260,19 +317,49 @@ class AGBSInterpreter:
             print('|| {} ||'.format(r_nxt))
             print('||{}||\n'.format('=' * (len(r_nxt) + 2)), Style.RESET_ALL)
             entry_full = self.initial.assume(nxt)
+            r_cstr = ''
+            for i, (e, a) in enumerate(constraints):
+                r_expr = ' + '.join('({})*{}'.format(v, n) for n, v in e.items() if n != '_')
+                r_expr = r_expr + ' + {}'.format(e['_'])
+                if a > 0:
+                    r_cstr = r_cstr + '[{}+]: '.format(i) + r_expr + ' >= 0\n'
+                else:
+                    r_cstr = r_cstr + '[{}-]: '.format(i) + r_expr + ' <= 0\n'
+            print('Constraints: ', r_cstr)
             status, pattern, picked = self.fwd(entry_full, forced_active=f_active, forced_inactive=f_inactive)
 
-            if status > 0:
+            if status == 1:
                 print('✔︎')
                 return alternatives
-            elif status < 0:
+            elif status == -1:
                 print('✘')
+                return alternatives
+            elif status is None:
+                print('TODO')
                 return alternatives
             else:
                 (chosen, expression) = picked
                 r_expr = ' + '.join('({})*{}'.format(v, n) for n, v in expression.items() if n != '_')
-                r_cstr = 'Constraint: ' + r_expr + ' + {}'.format(expression['_'])
+                r_cstr = r_expr + ' + {}'.format(expression['_'])
                 activity = self.original_status(chosen)
+                # if constraints and self.is_redundant((expression, -activity), dict([(f[0].name, f[1]) for f in nxt]), constraints):
+                #     print('Redundant Constraint: ', r_cstr, ' <= 0')
+                #     # the alternative should be unfeasible
+                #     # ...
+                #     # (_chosen, _constraints, _nxt, _f_active, _f_inactive) = alternatives[-1]
+                #     # for name in chosen:
+                #     #     _f_inactive.add(self.relus_name2node[VariableIdentifier(name)])
+                #     # alternatives[-1] = (_chosen, _constraints, _nxt, _f_active, _f_inactive)
+                #     # return alternatives
+                # elif constraints and self.is_redundant((expression, activity), dict([(f[0].name, f[1]) for f in nxt]), constraints):
+                #     print('Redundant Constraint: ', r_cstr, ' >= 0')
+                #     # the alternative should be unfeasible
+                #     # ...
+                #     # (_chosen, _constraints, _nxt, _f_active, _f_inactive) = alternatives[-1]
+                #     # for name in chosen:
+                #     #     _f_active.add(self.relus_name2node[VariableIdentifier(name)])
+                #     # alternatives[-1] = (_chosen, _constraints, _nxt, _f_active, _f_inactive)
+                #     # return alternatives
                 alt_f_active, alt_f_inactive = set(f_active), set(f_inactive)
                 if activity > 0:  # originally active
                     for name in chosen:
@@ -287,7 +374,7 @@ class AGBSInterpreter:
                     r_cstr = r_cstr + ' <= 0'
                     for name in chosen:
                         alt_f_inactive.add(self.relus_name2node[VariableIdentifier(name)])
-                print(r_cstr)
+                print('Added Constraint: ', r_cstr)
                 alt_constraints = list(constraints)
                 alt_constraints.append((expression, activity))
                 alt_nxt = self.to_pulp(dict([(f[0].name, f[1]) for f in nxt]), alt_constraints)
@@ -314,30 +401,27 @@ class AGBSInterpreter:
             _d = set(self.relus_node2name[n].name for n in d)
             self._pattern.append((_a, _d))
 
+        prefix = list()
         print(Fore.MAGENTA + '\n||========||')
-        print('|| Path 1 ||')
+        print('|| Path 0 ||')
         print('||========||\n', Style.RESET_ALL)
         nxt = [(feature, (0, 1)) for feature in self.inputs]
         f_active, f_inactive, constraints, alternatives = set(), set(), list(), list()
-        alternatives = self.search(nxt, f_active, f_inactive, constraints)
-
-        print(Fore.MAGENTA + '\n||========||')
-        print('|| Path 2 ||')
-        print('||========||\n', Style.RESET_ALL)
-        relu, constraints, nxt, f_active, f_inactive = alternatives[-1]
-        prefix = alternatives[:-1]
         suffix = self.search(nxt, f_active, f_inactive, constraints)
+        alternatives = prefix + suffix
 
-        print(Fore.MAGENTA + '\n||========||')
-        print('|| Path 3 ||')
-        print('||========||\n', Style.RESET_ALL)
-        relu, constraints, nxt, f_active, f_inactive = suffix[-1]
-        prefix = prefix + suffix[:-1]
-        suffix = self.search(nxt, f_active, f_inactive, constraints)
+        path = 1
+        while len(alternatives) > 0 and path < 50:
+            print(Fore.MAGENTA + '\n||========||')
+            print('|| Path {} ||'.format(path))
+            print('||========||\n', Style.RESET_ALL)
+            relu, constraints, nxt, f_active, f_inactive = alternatives[-1]
+            prefix = alternatives[:-1]
+            suffix = self.search(nxt, f_active, f_inactive, constraints)
+            alternatives = prefix + suffix
+            path = path + 1
 
-        print('Pause')
-
-
+        print('Done')
 
 class ActivationPatternForwardSemantics(DefaultForwardSemantics):
 

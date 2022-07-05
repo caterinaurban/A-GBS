@@ -14,6 +14,7 @@ from apronpy.texpr0 import TexprRtype, TexprRdir, TexprDiscr, TexprOp
 from apronpy.texpr1 import PyTexpr1
 from apronpy.var import PyVar
 from pip._vendor.colorama import Fore, Style
+from pulp import pulp, PULP_CBC_CMD
 
 from agbs.abstract_domains.interval_domain import IntervalLattice
 from agbs.abstract_domains.state import State
@@ -96,6 +97,48 @@ def evaluate(dictionary, bounds):
         else:
             result = result._add(coeff)
     return result
+
+
+def evaluate_with_constraints(dictionary, bounds, constraints):
+    ranges = {"__dummy": (0, 0)}
+    for var, val in bounds.items():
+        ranges[var] = (val.lower, val.upper)
+    current = dict(
+        objective=dict(
+            name='OBJ',
+            coefficients=[
+                {"name": name, "value": value} for name, value in dictionary.items() if name != '_'
+            ]
+        ),
+        constraints=[
+            dict(
+                sense=status,
+                pi=None,
+                constant=expression['_'],
+                name=None,
+                coefficients=[
+                    {"name": name, "value": value} for name, value in expression.items() if name != '_'
+                ],
+            ) for expression, status in constraints
+        ],
+        variables=[
+            dict(lowBound=l, upBound=u, cat="Continuous", varValue=None, dj=None, name=v)
+            for v, (l, u) in ranges.items()],
+        parameters=dict(name="NoName", sense=1, status=0, sol_status=0),
+        sos1=list(),
+        sos2=list(),
+    )
+    _current = deepcopy(current)
+    _current['parameters'] = {'name': '', 'sense': 1, 'status': 1, 'sol_status': 1}  # min
+    _, _problem = pulp.LpProblem.fromDict(_current)
+    _problem.solve(PULP_CBC_CMD(msg=False))
+    lower = pulp.value(_problem.objective) + dictionary['_']
+    current_ = deepcopy(current)
+    current_['parameters'] = {'name': '', 'sense': -1, 'status': 1, 'sol_status': 1}  # max
+    _, problem_ = pulp.LpProblem.fromDict(current_)
+    problem_.solve(PULP_CBC_CMD(msg=False))
+    upper = pulp.value(problem_.objective) + dictionary['_']
+    return IntervalLattice(lower, upper)
 
 
 def substitute_in_dict(todict, var, rhs):
@@ -251,7 +294,7 @@ class SymbolicState(State):
     def _substitute(self, left: Expression, right: Expression) -> 'SymbolicState':
         raise NotImplementedError(f"Call to _substitute is unexpected!")
 
-    def affine(self, left: List[PyVar], right: List[PyTexpr1]) -> 'SymbolicState':
+    def affine(self, left: List[PyVar], right: List[PyTexpr1], constraints=None) -> 'SymbolicState':
         if self.is_bottom():
             return self
         assignments = dict()
@@ -261,7 +304,10 @@ class SymbolicState(State):
             for sym, val in self.symbols.values():
                 rhs = substitute_in_dict(rhs, sym, val)
             assignments[name] = (name, rhs)
-            bound = evaluate(rhs, self.bounds)
+            if constraints:
+                bound = evaluate_with_constraints(rhs, self.bounds, constraints)
+            else:
+                bound = evaluate(rhs, self.bounds)
             self.bounds[name] = IntervalLattice(bound.lower, bound.upper)
             if bound.lower < 0 and 0 < bound.upper:
                 self.expressions[name] = rhs
