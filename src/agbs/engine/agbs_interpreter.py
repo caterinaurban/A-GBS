@@ -1,10 +1,12 @@
 from copy import deepcopy
 from queue import Queue
-from typing import Set, Dict
+from typing import Set, Dict, Tuple, List, FrozenSet
 
+from pulp import pulp, PULP_CBC_CMD
 from pip._vendor.colorama import Fore, Style
 
 from agbs.abstract_domains.state import State
+from agbs.abstract_domains.symbolic_domain import substitute_in_dict
 from agbs.core.cfg import Node, Function, Activation
 from agbs.core.expressions import VariableIdentifier
 from agbs.core.statements import Call
@@ -22,6 +24,7 @@ class AGBSInterpreter:
         self._relus_node2name = {n: v for v, n in nodes[1].items()}
         self._outputs = nodes[2]
         self._initial = None
+        self._pattern = None
 
     @property
     def cfg(self):
@@ -54,6 +57,10 @@ class AGBSInterpreter:
     @property
     def initial(self):
         return deepcopy(self._initial)
+
+    @property
+    def pattern(self) -> List[Tuple[Set[str], Set[str]]]:
+        return self._pattern
 
     def fwd(self, initial, forced_active=None, forced_inactive=None):
         """Single run of the forward analysis with the abstract domain"""
@@ -97,29 +104,196 @@ class AGBSInterpreter:
             for node in self.cfg.successors(current):
                 worklist.put(self.cfg.nodes[node.identifier])
 
-        state.log(self.outputs)
+        # state.log(self.outputs)
 
-        absolute = dict((k, abs(v)) for k, v in state.polarities.items())  # empty if all relus are fixed
-        balanced = min(absolute, key=absolute.get) if absolute else None
-        polarity = absolute[balanced] if balanced else None
-        symbols = state.expressions[balanced] if balanced else None
+        # get lower-bounds and upper-bounds for all outputs
+        lowers: Dict[str, float] = dict((o.name, state.bounds[o.name].lower) for o in self.outputs)
+        uppers: Dict[str, float] = dict((o.name, state.bounds[o.name].upper) for o in self.outputs)
 
-        return activations, (balanced, polarity, symbols)
+        self.print_pattern(activations)
+        if all(lower >= 0 for lower in lowers.values()):
+            return 1, activations, None
+        elif any(upper < 0 for upper in uppers.values()):
+            return -1, activations, None
+        else:
+            # retrieve uncertain relus
+            uncertain: List[Set[str]] = list()
+            for pack in activations:
+                if pack[2]:
+                    uncertain.append({self.relus_node2name[n].name for n in pack[2]})
+            if len(uncertain) == 0:
+                print('WTF')
+            # pick output with smallest lower-bound
+            lowers: Dict[str, float] = dict((o.name, state.bounds[o.name].lower) for o in self.outputs)
+            picked: str = min(lowers, key=lowers.get)
+            # retrieve its symbolic expression
+            expression: Dict[str, float] = state.symbols[picked][1]
+            # remove inputs and constants from symbolic expression to only remain with relus
+            for i in self.inputs:
+                expression.pop(i.name, None)
+            expression.pop('_')
+            # remove forced active relus
+            for r in forced_active:
+                expression.pop(self.relus_node2name[r].name)
+            # rank relus by layer
+            layer_score = lambda relu_name: len(uncertain) - list(relu_name in u for u in uncertain).index(True)
+            # rank relus by coefficient
+            coeff_rank = sorted(expression.items(), key=lambda item: (layer_score(item[0]), abs(item[1])), reverse=True)
+            coeff_score = lambda relu_name: list(relu_name == item[0] for item in coeff_rank).index(True)
+            # rank relu by range size
+            range_size = lambda relu_name: state.ranges[relu_name]
+            range_rank = sorted(list((relu, range_size(relu)) for relu in expression.keys()), key=lambda item: (layer_score(item[0]), item[1]), reverse=True)
+            range_score = lambda relu_name: list(relu_name == item[0] for item in range_rank).index(True)
+            # rank relu by polarities
+            polarity = lambda relu_name: abs(state.polarities[relu_name])
+            pol_rank = sorted(list((relu, polarity(relu)) for relu in expression.keys()), key=lambda item: (len(uncertain) - layer_score(item[0]), item[1]))
+            pol_score = lambda relu_name: list(relu_name == item[0] for item in pol_rank).index(True)
+            # determine final rank
+            rank = lambda relu: coeff_score(relu) + range_score(relu) + pol_score(relu)
+            ranked = sorted(list((relu, rank(relu)) for relu in expression.keys()), key=lambda item: item[1])
+            # return chosen uncertain relu(s)
+            choice: str = ranked[0][0]
+            r_layer = list(choice in u for u in uncertain).index(True)
+            r_coeff = expression[choice]
+            r_range = state.ranges[choice]
+            r_polarity = state.polarities[choice]
+            r_rank = '(layer: {}, coeff: {}, range: {}, polarity, {})'.format(r_layer, r_coeff, r_range, r_polarity)
+            print('Choice: ', choice, r_rank)
+            chosen: Set[str] = {choice}
+            expression = state.expressions[choice]
+            r_chosen = list()
+            for name, expr in state.expressions.items():
+                if name != choice and expr == expression:
+                    chosen.add(name)
+                    r_chosen.append(name)
+            print('Chosen: {}'.format(', '.join(r_chosen)))
+            # back-substitution
+            current = dict(expression)
+            while any(variable in state.expressions for variable in expression.keys()):
+                for sym, val in state.expressions.items():
+                    if sym in current:
+                        current = substitute_in_dict(current, sym, val)
+                expression = current
+            return 0, activations, (chosen, expression)
+
+    def to_pulp(self, ranges, constraints):
+        _ranges = dict(ranges)
+        _ranges["__dummy"] = (0, 0)
+        current = dict(
+            objective=dict(name=None, coefficients=[{"name": "__dummy", "value": 1}]),
+            constraints=[
+                dict(
+                    sense=status,
+                    pi=None,
+                    constant=expression['_'],
+                    name=None,
+                    coefficients=[
+                        {"name": name, "value": value} for name, value in expression.items() if name != '_'
+                    ],
+                ) for expression, status in constraints
+            ],
+            variables=[dict(lowBound=l, upBound=u, cat="Continuous", varValue=None, dj=None, name=v) for v, (l, u) in
+                       _ranges.items()],
+            parameters=dict(name="NoName", sense=1, status=0, sol_status=0),
+            sos1=list(),
+            sos2=list(),
+        )
+        var, problem = pulp.LpProblem.fromDict(current)
+        problem.solve(PULP_CBC_CMD(msg=False))
+        if problem.status == -1:
+            return None
+        else:
+            bounds = dict()
+            for name in ranges:
+                _current = deepcopy(current)
+                _current['objective'] = {'name': 'OBJ', 'coefficients': [{'name': name, 'value': 1}]}
+                _current['parameters'] = {'name': '', 'sense': 1, 'status': 1, 'sol_status': 1}  # min
+                _, _problem = pulp.LpProblem.fromDict(_current)
+                _problem.solve(PULP_CBC_CMD(msg=False))
+                lower = pulp.value(_problem.objective)
+                current_ = deepcopy(current)
+                current_['objective'] = {'name': 'OBJ', 'coefficients': [{'name': name, 'value': 1}]}
+                current_['parameters'] = {'name': '', 'sense': -1, 'status': 1, 'sol_status': 1}  # max
+                _, problem_ = pulp.LpProblem.fromDict(current_)
+                problem_.solve(PULP_CBC_CMD(msg=False))
+                upper = pulp.value(problem_.objective)
+                bounds[VariableIdentifier(name)] = (lower, upper)
+            return list(bounds.items())
+
+    def original_status(self, relu_names):
+        # retrieve uncertain relus
+        for pack in self.pattern:
+            if all(name in pack[0] for name in relu_names):
+                return 1
+            elif all(name in pack[1] for name in relu_names):
+                return -1
+        raise ValueError
 
     def print_pattern(self, activations):
         activated, deactivated, uncertain = 0, 0, 0
-        print('Activation Pattern: {', end='')
+        # print('Activation Pattern: {', end='')
         for (a, d, u) in activations:
-            print('[')
+            # print('[')
             activated += len(a)
-            print('activated: ', ','.join(self.relus_node2name[n].name for n in a))
+            # print('activated: ', ','.join(self.relus_node2name[n].name for n in a))
             deactivated += len(d)
-            print('deactivated: ', ','.join(self.relus_node2name[n].name for n in d))
+            # print('deactivated: ', ','.join(self.relus_node2name[n].name for n in d))
             uncertain += len(u)
-            print('uncertain: ', ','.join(self.relus_node2name[n].name for n in u))
-            print(']', end='')
-        print('}')
+            # print('uncertain: ', ','.join(self.relus_node2name[n].name for n in u))
+            # print(']', end='')
+        # print('}')
         print('#Active: ', activated, '#Inactive: ', deactivated, '#Uncertain: ', uncertain, '\n')
+
+    def search(self, in_nxt, in_f_active, in_f_inactive, in_constraints):
+        status = 0
+        nxt = in_nxt
+        f_active, f_inactive = set(in_f_active), set(in_f_inactive)
+        constraints = list(in_constraints)
+        alternatives = list()
+        while status == 0:
+            if nxt is None:
+                print('\n⊥︎')
+                return alternatives
+
+            r_nxt = '; '.join('{} ∈ [{}, {}]'.format(i, l, u) for i, (l, u) in nxt if l != u)
+            print(Fore.YELLOW + '\n||{}||'.format('=' * (len(r_nxt) + 2)))
+            print('|| {} ||'.format(r_nxt))
+            print('||{}||\n'.format('=' * (len(r_nxt) + 2)), Style.RESET_ALL)
+            entry_full = self.initial.assume(nxt)
+            status, pattern, picked = self.fwd(entry_full, forced_active=f_active, forced_inactive=f_inactive)
+
+            if status > 0:
+                print('✔︎')
+                return alternatives
+            elif status < 0:
+                print('✘')
+                return alternatives
+            else:
+                (chosen, expression) = picked
+                r_expr = ' + '.join('({})*{}'.format(v, n) for n, v in expression.items() if n != '_')
+                r_cstr = 'Constraint: ' + r_expr + ' + {}'.format(expression['_'])
+                activity = self.original_status(chosen)
+                alt_f_active, alt_f_inactive = set(f_active), set(f_inactive)
+                if activity > 0:  # originally active
+                    for name in chosen:
+                        f_inactive.add(self.relus_name2node[VariableIdentifier(name)])
+                    r_cstr = r_cstr + ' <= 0'
+                    for name in chosen:
+                        alt_f_active.add(self.relus_name2node[VariableIdentifier(name)])
+                else:  # originally inactive
+                    assert activity < 0
+                    for name in chosen:
+                        f_active.add(self.relus_name2node[VariableIdentifier(name)])
+                    r_cstr = r_cstr + ' <= 0'
+                    for name in chosen:
+                        alt_f_inactive.add(self.relus_name2node[VariableIdentifier(name)])
+                print(r_cstr)
+                alt_constraints = list(constraints)
+                alt_constraints.append((expression, activity))
+                alt_nxt = self.to_pulp(dict([(f[0].name, f[1]) for f in nxt]), alt_constraints)
+                constraints.append((expression, -activity))
+                nxt = self.to_pulp(dict([(f[0].name, f[1]) for f in nxt]), constraints)
+                alternatives.append((chosen, alt_constraints, alt_nxt, alt_f_active, alt_f_inactive))
 
     def analyze(self, initial: State):
         print(Fore.BLUE + '\n||==================================||')
@@ -132,19 +306,36 @@ class AGBSInterpreter:
         print('||==========||\n', Style.RESET_ALL)
         unperturbed = [(feature, (0, 0)) for feature in self.inputs]
         entry_orig = self.initial.assume(unperturbed)
-        pattern, (balanced, polarity, symbols) = self.fwd(entry_orig)
-        self.print_pattern(pattern)
+        status, pattern, _ = self.fwd(entry_orig)
+        # set original activation pattern
+        self._pattern = list()
+        for (a, d, _) in pattern:
+            _a = set(self.relus_node2name[n].name for n in a)
+            _d = set(self.relus_node2name[n].name for n in d)
+            self._pattern.append((_a, _d))
 
-        print(Fore.MAGENTA + '\n||======||')
-        print('|| Full ||')
-        print('||======||\n', Style.RESET_ALL)
-        full = [(feature, (0, 1)) for feature in self.inputs]
-        entry_full = self.initial.assume(full)
-        pattern, (balanced, polarity, symbols) = self.fwd(entry_full)
-        self.print_pattern(pattern)
+        print(Fore.MAGENTA + '\n||========||')
+        print('|| Path 1 ||')
+        print('||========||\n', Style.RESET_ALL)
+        nxt = [(feature, (0, 1)) for feature in self.inputs]
+        f_active, f_inactive, constraints, alternatives = set(), set(), list(), list()
+        alternatives = self.search(nxt, f_active, f_inactive, constraints)
 
-        # print('Total ReLUs: ', len(self.relus))
-        # activated, deactivated, uncertain, (balanced, polarity, symbols) = self.fwd(initial)
+        print(Fore.MAGENTA + '\n||========||')
+        print('|| Path 2 ||')
+        print('||========||\n', Style.RESET_ALL)
+        relu, constraints, nxt, f_active, f_inactive = alternatives[-1]
+        prefix = alternatives[:-1]
+        suffix = self.search(nxt, f_active, f_inactive, constraints)
+
+        print(Fore.MAGENTA + '\n||========||')
+        print('|| Path 3 ||')
+        print('||========||\n', Style.RESET_ALL)
+        relu, constraints, nxt, f_active, f_inactive = suffix[-1]
+        prefix = prefix + suffix[:-1]
+        suffix = self.search(nxt, f_active, f_inactive, constraints)
+
+        print('Pause')
 
 
 

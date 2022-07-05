@@ -6,7 +6,7 @@ Symbolic Constant Propagation (Variant 3)
 """
 import time
 from copy import deepcopy
-from math import inf
+from math import inf, isclose
 from typing import Set, List, Dict, Tuple
 
 from apronpy.manager import PyManager
@@ -130,6 +130,7 @@ class SymbolicState(State):
         self.symbols: Dict[str, Tuple[str, dict]] = dict()
         self.expressions = dict()
         self.polarities = dict()
+        self.ranges = dict()
         self.flag = None
 
     @copy_docstring(State.bottom)
@@ -263,8 +264,9 @@ class SymbolicState(State):
             bound = evaluate(rhs, self.bounds)
             self.bounds[name] = IntervalLattice(bound.lower, bound.upper)
             if bound.lower < 0 and 0 < bound.upper:
-                self.expressions[name] = (rhs, rhs)
+                self.expressions[name] = rhs
                 self.polarities[name] = (bound.lower + bound.upper) / (bound.upper - bound.lower)
+                self.ranges[name] = bound.upper - bound.lower
         self.symbols = assignments
         return self
 
